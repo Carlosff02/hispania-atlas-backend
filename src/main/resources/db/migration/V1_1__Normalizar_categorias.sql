@@ -1,0 +1,44 @@
+-- ============================================================================
+-- V1.1 — Normaliza las categorías sembradas por V1
+-- ============================================================================
+--
+-- Existe por un fallo concreto de la cadena, y conviene explicarlo porque el
+-- nombre del archivo no lo cuenta.
+--
+-- V1 crea la tabla `lugares` con `category VARCHAR(50)` sin ninguna restricción
+-- y siembra dos lugares de ejemplo con la categoría en el formato antiguo:
+-- 'Arte' y 'Arqueología' (minúsculas, y con tilde en la segunda).
+--
+-- V2 añade el CHECK `lugares_category_check`, que solo admite los nueve valores
+-- canónicos EN MAYÚSCULAS: 'ARTE', 'ARQUEOLOGIA', 'DANZA', ...
+--
+-- PostgreSQL valida las filas existentes en el mismo instante en que se añade una
+-- restricción CHECK: no es una regla para el futuro, se aplica a la tabla tal
+-- como está. Por eso V2 falla sobre una base vacía:
+--
+--   ERROR:  check constraint "lugares_category_check" of relation "lugares"
+--           is violated by some row
+--
+-- Y como V2 es una migración de una sola sentencia y Flyway se detiene en el
+-- primer fallo, V3 a V6 nunca se aplican: la aplicación no arranca.
+--
+-- POR QUÉ NO SE ARREGLA V1 EDITÁNDOLO
+-- V1 a V4 están copiadas byte a byte del proyecto Quarkus original, y Flyway
+-- guarda un checksum de cada migración ya aplicada. Reescribir una sola palabra
+-- de V1 cambia su checksum y el arranque falla con un error de checksum: se
+-- cambia un problema por otro. Tocar V2 tampoco sirve, por la misma razón.
+--
+-- La salida es una migración con versión 1.1, que Flyway ejecuta ENTRE V1 y V2:
+-- en una base nueva normaliza los valores heredados y luego V2 encuentra la
+-- tabla ya compatible. En una base que ya tiene V1..V6 aplicados es un UPDATE sin
+-- filas afectadas, porque la restricción de V2 ya obliga a los valores canónicos.
+-- Por eso va con `spring.flyway.out-of-order=true`: sin esa propiedad, Flyway
+-- rechaza una migración pendiente cuya versión es menor que la última aplicada.
+--
+-- El mapeo es explícito y no una normalización genérica con UPPER(): un
+-- `UPPER()` silenciaría cualquier valor desconocido y dejaría datos corruptos sin
+-- avisar. Si alguien carga una categoría que no está en la lista, esta migración
+-- no la toca y V2 la rechaza con un error claro, que es lo correcto.
+
+UPDATE lugares SET category = 'ARTE'        WHERE category = 'Arte';
+UPDATE lugares SET category = 'ARQUEOLOGIA' WHERE category = 'Arqueología';

@@ -1,0 +1,377 @@
+package com.hispania.presentation.controllers;
+
+import com.jayway.jsonpath.JsonPath;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.web.client.RestClient;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * Pruebas funcionales contra la API por HTTP real, con Postgres de verdad.
+ *
+ * <h2>Por que existe este archivo</h2>
+ *
+ * <p>El README admite un hueco: el recorrido completo (iniciar sesion, proponer una
+ * expresion, moderarla y verla publicada) se probo a mano contra la aplicacion en
+ * marcha, pero no estaba automatizado. Y no es un hueco que se pueda cerrar con lo
+ * que ya hay:
+ *
+ * <ul>
+ *   <li>Los tests de servicio usan Mockito, asi que un token nunca se firma: el
+ *       {@code JwtAuthenticationToken} lo construye el propio test.</li>
+ *   <li>{@code LugarControllerTest} es un slice {@code @WebMvcTest} sin la cadena de
+ *       filtros, porque el proyecto no depende de {@code spring-security-test}: ahi
+ *       un POST pasa sin token.</li>
+ *   <li>{@code PermisosDeEscrituraTest} evalua el {@code @PreAuthorize} con SpEL
+ *       fuera de Spring, porque la seguridad de metodo no se carga en un slice.</li>
+ * </ul>
+ *
+ * <p>Es decir: las tres piezas por separado estan probadas, y ninguna prueba dice que
+ * encajen. Aqui encajan, porque {@code @SpringBootTest} con
+ * {@code RANDOM_PORT} levanta el servidor de verdad: el {@code bcrypt} hashea la
+ * contrasena, el {@code JwtEncoder} firma el token, la cadena de filtros lo valida y
+ * {@code @PreAuthorize} consulta la jerarquia contra el rol que viene en ese token.
+ *
+ * <h2>Por que dos actores</h2>
+ *
+ * <p>El recorrido necesita dos cuentas porque los rangos no se solapan: un USUARIO
+ * puede proponer pero no moderar, y un ADMIN_SISTEMA puede moderar pero no propone
+ * (pasar por la cola no le aportaria nada). Si se hiciera con una sola cuenta, o
+ * se estarian saltando la regla de no autoaprobar, o la propuesta se haria con el
+ * rol que no puede.
+ *
+ * <h2>Aislamiento</h2>
+ *
+ * <p>El contenedor y el contexto se comparten entre los tests, como ya hace
+ * {@code MigracionesSobrePostgresTest}. Cada test da de alta sus propias cuentas con
+ * nombres distintos, y el test que escribe busca un pais sin expresiones, de modo
+ * que no depende de lo que otro haya escrito ni le pisa.
+ */
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@Testcontainers
+@DisplayName("La API sobre HTTP real")
+class ApiSobreHttpRealTest {
+
+    @Container
+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:17-alpine");
+
+    /**
+     * {@code jwt.secret} no tiene valor por defecto a proposito, asi que hay que
+     * darle uno o el contexto no arranca. Este solo existe durante la prueba.
+     */
+    private static final String SECRETO =
+            "clave-que-solo-vive-en-esta-prueba-de-integracion-1234567890";
+
+    private static final String ADMIN_USUARIO = "root_prueba";
+    private static final String ADMIN_EMAIL = "root@prueba.local";
+    private static final String ADMIN_CLAVE = "clave-del-admin-de-prueba";
+
+    /** Categoria válida en el CHECK de destino, para no pelearse con el enum. */
+    private static final String CATEGORIA = "GASTRONOMIA";
+
+    /** Contador para que cada cuenta registrada en un test sea una cuenta nueva. */
+    private static int contador;
+
+    @DynamicPropertySource
+    static void propiedades(DynamicPropertyRegistry registro) {
+        registro.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registro.add("spring.datasource.username", POSTGRES::getUsername);
+        registro.add("spring.datasource.password", POSTGRES::getPassword);
+        registro.add("jwt.secret", () -> SECRETO);
+
+        // El bootstrap corre en el arranque, y solo crea la cuenta si define las
+        // tres variables. Es la via normal de dar de alta al primer administrador,
+        // asi que la prueba la usa tal cual lo haria un despliegue real.
+        registro.add("app.bootstrap.admin-username", () -> ADMIN_USUARIO);
+        registro.add("app.bootstrap.admin-email", () -> ADMIN_EMAIL);
+        registro.add("app.bootstrap.admin-password", () -> ADMIN_CLAVE);
+    }
+
+    @LocalServerPort
+    private int puerto;
+
+    @Autowired
+    private JdbcTemplate jdbc;
+
+    private RestClient http;
+    private String tokenAdmin;
+
+    @BeforeEach
+    void iniciarSesionDelAdministrador() {
+        http = RestClient.builder().baseUrl("http://localhost:" + puerto).build();
+
+        Respuesta login = enviarPost("/api/auth/login", loginJson(ADMIN_USUARIO, ADMIN_CLAVE), null);
+        assertThat(login.estado())
+                .as("el ADMIN_SISTEMA sembrado en el arranque debe poder iniciar sesion")
+                .isEqualTo(200);
+
+        tokenAdmin = leerStr(login.cuerpo(), "$.token");
+        assertThat(tokenAdmin).as("la respuesta del login trae el token").isNotBlank();
+    }
+
+    // ------------------------------------------------------------------ BF-01
+
+    @Test
+    @DisplayName("el recorrido completo deja la expresion aprobada y ya visible en la API")
+    void elRecorridoCompletoPublicaLaExpresionAprobada() {
+        String pais = paisSinExpresiones();
+        String nombre = cuentaNueva();
+        String clave = "clave-de-prueba-123";
+
+        // 1. Alta de la cuenta que propone. El registro es publico y toda cuenta nace
+        //    en USUARIO: no hay campo de rol en la peticion, y esa es justamente la
+        //    razon de que nadie pueda autoproclamarse colaborador.
+        Respuesta alta = enviarPost("/api/auth/registro", """
+                {
+                  "username": "%s",
+                  "email": "%s@ejemplo.local",
+                  "password": "%s",
+                  "nombre": "Persona que propone"
+                }
+                """.formatted(nombre, nombre, clave), null);
+
+        assertThat(alta.estado()).as("el registro es publico: no hace falta token").isEqualTo(201);
+        assertThat(leer(alta.cuerpo(), "$.usuario.rol"))
+                .as("toda cuenta nace en el rango mas bajo")
+                .isEqualTo("USUARIO");
+
+        String tokenUsuario = leer(alta.cuerpo(), "$.token");
+
+        // 2. La propuesta. Un USUARIO si puede proponer, que es lo que hace falta.
+        Respuesta propuesta = enviarPost("/api/expresiones/propuestas", """
+                {
+                  "titulo": "Arepas de la Casa",
+                  "categoria": "%s",
+                  "country": "%s",
+                  "descText": "Masa de maíz cocida sobre un fuego abierto, el alimento de la casa.",
+                  "imagen": null,
+                  "creditos": null
+                }
+                """.formatted(CATEGORIA, pais), tokenUsuario);
+
+        assertThat(propuesta.estado()).as("un USUARIO puede proponer").isEqualTo(201);
+        assertThat(propuesta.cuerpo())
+                .as("la cabecera Location apunta al identificador de la propuesta")
+                .contains("/api/expresiones/propuestas/");
+
+        long idPropuesta = Long.parseLong(leer(propuesta.cuerpo(), "$.id"));
+        assertThat(leerLong(propuesta.cuerpo(), "$.estado")).isEqualTo("PENDIENTE");
+        assertThat(leerStr(propuesta.cuerpo(), "$.autor")).isEqualTo(nombre);
+
+        // 3. La cola de moderacion la ve el administrador, que si supera el umbral.
+        //    Y la propuesta ajena aparece con su autor, que es lo que permite
+        //    decidir leyendo en vez de con un identificador numerico.
+        Respuesta cola = enviarGet("/api/expresiones/propuestas/pendientes", tokenAdmin);
+        assertThat(cola.estado()).isEqualTo(200);
+        assertThat(cola.cuerpo()).contains(nombre);
+
+        // 4. Aprobar. Es un PUT porque el paso es atomico: la propuesta pasa a
+        //    APROBADA y la expresion se inserta, o no ocurre ninguna de las dos.
+        Respuesta revision = enviarPut("/api/expresiones/propuestas/" + idPropuesta + "/revision",
+                """
+                {"estado": "APROBADA"}
+                """, tokenAdmin);
+
+        assertThat(revision.estado()).as("el administrador puede moderar").isEqualTo(200);
+        assertThat(leerStr(revision.cuerpo(), "$.estado")).isEqualTo("APROBADA");
+        assertThat(leer(revision.cuerpo(), "$.revisor")).isEqualTo(ADMIN_USUARIO);
+        assertThat(leer(revision.cuerpo(), "$.revisadoAt")).as("se fecha la revision").isNotNull();
+
+        // 5. El identificador de la expresion se genera al aprobar, no antes. Por eso
+        //    la propuesta no lo traia: todavia no se comprobaba si chocaba con otro.
+        String idEsperado = "arepas_de_la_casa_" + pais.toLowerCase();
+
+        Respuesta publicadas = enviarGet("/api/expresiones/" + pais, tokenAdmin);
+        assertThat(publicadas.estado()).as("un pais con expresiones responde 200").isEqualTo(200);
+        assertThat(publicadas.cuerpo())
+                .as("la expresion aprobada ya sale por la API, con su id derivado del titulo")
+                .contains(idEsperado);
+        assertThat(publicadas.cuerpo()).contains("Arepas de la Casa");
+        assertThat(publicadas.cuerpo()).contains(pais);
+
+        // El titulo lleva "maíz" a proposito, y no por descuido. Es la primera vez que
+        // un texto acentuado recorre la vuelta entera (peticion -> JSON -> Postgres ->
+        // JSON -> respuesta) y este proyecto ya ha tenido dos bugs justo en eso: el
+        // enum Region guardaba el nombre de la constante en vez del texto acentuado, y
+        // leer los paises daba 500. Si alguien cambia el charset en algun punto de la
+        // cadena, la afirmacion falla aqui y no en produccion.
+        assertThat(publicadas.cuerpo())
+                .as("la tilde de 'maíz' sobrevive a la vuelta completa")
+                .contains("maíz");
+
+        // 6. Y la base queda coherente: la propuesta APROBADA con revisor, y la
+        //    expresion insertada. Esto es lo que la UNIQUE (pais, categoria) protege.
+        assertThat(jdbc.queryForObject(
+                "SELECT estado FROM propuestas_expresion WHERE id = ?", String.class, idPropuesta))
+                .isEqualTo("APROBADA");
+
+        assertThat(jdbc.queryForObject(
+                "SELECT revisado_por FROM propuestas_expresion WHERE id = ?",
+                Long.class, idPropuesta))
+                .as("la propuesta recuerda quien la aprobo")
+                .isEqualTo(leerStr(ADMIN_USUARIO));
+
+        assertThat(jdbc.queryForObject(
+                "SELECT pais_code FROM expresiones_culturales WHERE id = ?",
+                String.class, idEsperado))
+                .isEqualTo(pais);
+    }
+
+    // ------------------------------------------------------------------ BF-02
+
+    @Test
+    @DisplayName("lo publico se lee sin token: el mapa y los paises no piden cuenta")
+    void loPublicoSeLeeSinToken() {
+        Respuesta paises = enviarGet("/api/countries", null);
+        assertThat(paises.estado()).as("GET /api/countries es permitAll").isEqualTo(200);
+        assertThat(leer(paises.cuerpo(), "length()"))
+                .as("los 19 paises que siembra V7")
+                .isEqualTo(19);
+
+        assertThat(enviarGet("/api/places", null).estado())
+                .as("GET /api/places es permitAll")
+                .isEqualTo(200);
+    }
+
+    @Test
+    @DisplayName("expresiones sin token da 401: el catch-all las protege aunque no tengan PreAuthorize")
+    void expresionesSinTokenDa401() {
+        // Este test fija una diferencia que no se ve leyendo el controlador:
+        // `ExpresionCulturalController` no lleva `@PreAuthorize`, asi que parece
+        // publico, pero cae en el `anyRequest().authenticated()` de `SecurityConfig`
+        // porque la lista de permitAll solo menciona /countries y /places. El dia
+        // que alguien anada `/api/expresiones/**` a los permitAll creyendo que solo
+        // estaba explicandolo, este test es lo que se rompe.
+        Respuesta sinToken = enviarGet("/api/expresiones", null);
+        assertThat(sinToken.estado()).isEqualTo(401);
+
+        Respuesta conToken = enviarGet("/api/expresiones", tokenAdmin);
+        assertThat(conToken.estado()).as("con un token valido, si").isEqualTo(200);
+    }
+
+    @Test
+    @DisplayName("un token alterado no abre la puerta: la firma es lo que manda")
+    void unTokenAlteradoDa401() {
+        // Un JWT es legible por cualquiera, asi que el unico motivo por el que sirve
+        // es que el servidor pueda comprobar que nadie lo ha tocado. Cambiar un
+        // caracter del cuerpo tiene que invalidarlo.
+        String alterado = tokenAdmin.substring(0, tokenAdmin.length() - 2)
+                + (tokenAdmin.endsWith("A") ? "B" : "A")
+                + tokenAdmin.charAt(tokenAdmin.length() - 1);
+
+        assertThat(alterado).as("el token de la prueba se ha alterado de verdad").isNotEqualTo(tokenAdmin);
+        assertThat(enviarGet("/api/auth/yo", alterado).estado()).isEqualTo(401);
+    }
+
+    @Test
+    @DisplayName("un USUARIO propone y no modera: la jerarquia se respeta por el cable")
+    void unUsuarioProponeYNoModera() {
+        String nombre = cuentaNueva();
+        String token = registrarYToken(nombre, "clave-de-prueba-123");
+
+        Respuesta propuesta = enviarPost("/api/expresiones/propuestas", propuestaConPais(paisSinExpresiones()), token);
+        assertThat(propuesta.estado())
+                .as("USUARIO esta en el rango que puede proponer")
+                .isEqualTo(201);
+
+        Respuesta cola = enviarGet("/api/expresiones/propuestas/pendientes", token);
+        assertThat(cola.estado())
+                .as("pero no llega al umbral de COLABORADOR, y 403 no 401: esta autenticado")
+                .isEqualTo(403);
+        assertThat(cola.cuerpo()).contains("\"status\":403");
+    }
+
+    @Test
+    @DisplayName("un ADMIN_SISTEMA modera y no propone: pasar por la cola no le aporta nada")
+    void unAdministradorModeraYNoPropone() {
+        // El caso simetrico del anterior. No es un descuido de la jerarquia que el
+        // administrador no pueda proponer: si pudiera, tendria un atajo para escribir
+        // contenido sin pasar por la revision que existe para evitar exactamente eso.
+        assertThat(enviarGet("/api/expresiones/propuestas/pendientes", tokenAdmin).estado())
+                .as("ADMIN_SISTEMA supera el umbral de moderacion")
+                .isEqualTo(200);
+
+        Respuesta propuesta = enviarPost("/api/expresiones/propuestas",
+                propuestaConPais(paisSinExpresiones()), tokenAdmin);
+        assertThat(propuesta.estado())
+                .as("pero queda por encima del rango que puede proponer")
+                .isEqualTo(403);
+    }
+
+    // --------------------------------------------------------------- ayudantes
+
+    /** Lo que devuelve cada llamada: el codigo y el cuerpo tal cual, sin interpretar. */
+    private record Respuesta(int estado, String cuerpo) {
+    }
+
+    private Respuesta enviarGet(String ruta, String token) {
+        return ejecutar(http.get().uri(ruta), token);
+    }
+
+    private Respuesta enviarPost(String ruta, String cuerpo, String token) {
+        return ejecutar(
+                http.post().uri(ruta)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .body(cuerpo),
+                token);
+    }
+
+    private Respuesta enviarPut(String ruta, String cuerpo, String token) {
+        return ejecutar(
+                http.put().uri(ruta)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .body(cuerpo),
+                token);
+    }
+
+    /**
+     * {@code exchange} en vez de {@code retrieve} a proposito: {@code retrieve}
+     * lanza excepcion en cuanto el estado es 4xx, y aqui casi todas las respuestas
+     * interesantes lo son. Devolver el estado como dato es lo que permite escribir
+     * {@code assertThat(respuesta.estado()).isEqualTo(403)} sin try/catch.
+     */
+    private Respuesta ejecutar(RestClient.RequestHeadersSpec<?> peticion, String token) {
+        RestClient.RequestHeadersSpec<?> conToken = token == null
+                ? peticion
+                : peticion.header("Authorization", "Bearer " + token);
+
+        return conToken.exchange((peticionEnviada, respuesta) -> {
+            // `bodyTo` y no `getBodyTo`: la respuesta de `exchange` es una
+            // ConvertibleClientHttpResponse, que convierte el cuerpo al tipo pedido.
+            String cuerpo = respuesta.bodyTo(String.class);
+            return new Respuesta(respuesta.getStatusCode().value(), cuerpo == null ? "" : cuerpo);
+        }, false);
+    }
+    private static Object leer(String cuerpo, String rutaJson) {
+        return JsonPath.read(cuerpo, rutaJson);
+    }
+
+    private static String leerStr(String cuerpo, String rutaJson) {
+        Object v = leer(cuerpo, rutaJson);
+        return v == null ? null : v.toString();
+    }
+
+    private static long leerLong(String cuerpo, String rutaJson) {
+        Object v = leer(cuerpo, rutaJson);
+        if (v instanceof Number n) {
+            return n.longValue();
+        }
+        if (v instanceof String s) {
+            return Long.parseLong(s);
+        }
+        throw new IllegalStateException("No se puede convertir a long: " + v);
+    }
+}
+
