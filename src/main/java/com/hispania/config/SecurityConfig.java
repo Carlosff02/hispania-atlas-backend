@@ -81,23 +81,30 @@ public class SecurityConfig {
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
-                // Sin CSRF: la proteccion existe contra que un navegador envie a
-                // proposito una peticion con la sesion de otro sitio. Aqui no hay
-                // cookie de sesion, y una cabecera Authorization no se activa sola.
+                .cors(Customizer.withDefaults())
                 .csrf(csrf -> csrf.disable())
-                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .sessionManagement(session ->
+                        session.sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+                )
                 .oauth2ResourceServer(oauth -> oauth
-                        .jwt(jwt -> jwt.jwtAuthenticationConverter(jwtAuthenticationConverter)))
+                        .jwt(jwt ->
+                                jwt.jwtAuthenticationConverter(jwtAuthenticationConverter)
+                        )
+                )
                 .authorizeHttpRequests(auth -> auth
-                        // Lectura publica: es lo que la aplicacion ya permitia antes de
-                        // existir los usuarios, y sigue sin pedir cuenta para ver el mapa.
+                        .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
+
                         .requestMatchers(HttpMethod.GET, "/api/countries/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/places/**").permitAll()
-                        .requestMatchers(HttpMethod.POST, "/api/auth/login",
-                                         "/api/auth/registro").permitAll()
-                        // "catch-all" explicito: si manana se anade un endpoint
-                        // nuevo y nadie recuerda esta clase, nace protegido.
-                        .anyRequest().authenticated());
+
+                        .requestMatchers(
+                                HttpMethod.POST,
+                                "/api/auth/login",
+                                "/api/auth/registro"
+                        ).permitAll()
+
+                        .anyRequest().authenticated()
+                );
 
         return http.build();
     }
